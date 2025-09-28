@@ -1,0 +1,16 @@
+# Core math & DSP
+numpy>=1.26
+scipy>=1.13
+
+# Audio I/O
+soundfile>=0.12
+
+# Real-time audio playback / recording
+sounddevice>=0.4
+
+# Audio effects (EQ, delay, reverb, distortion, etc.)
+pedalboard>=0.9
+
+# MIDI support (optional, for future expansion)
+mido>=1.3
+python-rtmidi>=1.5
