@@ -453,42 +453,63 @@ class LiveUI(ttk.Frame):
     # ---------------- Transport (Play, REC, Tap, Style, Key, Scenes) ----------------
     def _build_transport(self):
         fx = ttk.Frame(self); fx.grid(row=0, column=0, sticky="ew", pady=(0,8))
-        for c in range(14): fx.columnconfigure(c, weight=1)
+        for c in range(16): fx.columnconfigure(c, weight=1)
 
-        self.btn_play = ttk.Button(fx, text="Play", command=self._toggle_play); self.btn_play.grid(row=0, column=0, padx=(0,8))
-        self.btn_rec  = ttk.Button(fx, text="REC",  command=self._toggle_record); self.btn_rec.grid(row=0, column=1, padx=(0,12))
+        self.btn_play = ttk.Button(fx, text="Play", command=self._toggle_play)
+        self.btn_play.grid(row=0, column=0, padx=(0,8))
 
+        self.btn_rec  = ttk.Button(fx, text="REC",  command=self._toggle_record)
+        self.btn_rec.grid(row=0, column=1, padx=(0,12))
+
+        # BPM label + numeric display + slider (30..230)
         ttk.Label(fx, text="BPM").grid(row=0, column=2, sticky="e")
         self.var_bpm = tk.IntVar(value=145)
-        s = ttk.Scale(fx, from_=120, to=160, orient="horizontal",
-                      command=lambda v: self._on_bpm_change(int(float(v))))
-        s.set(self.var_bpm.get()); s.grid(row=0, column=3, sticky="ew", padx=(6,12))
-        ttk.Button(fx, text="Tap", command=self._tap_tempo).grid(row=0, column=4, padx=(0,12))
+        self.lbl_bpm_val = ttk.Label(fx, textvariable=self.var_bpm, width=4, anchor="w")
+        self.lbl_bpm_val.grid(row=0, column=3, sticky="w", padx=(6,6))
 
-        ttk.Label(fx, text="Style").grid(row=0, column=5, sticky="e")
+        s = ttk.Scale(
+            fx, from_=30, to=230, orient="horizontal",
+            command=lambda v: self._on_bpm_change(int(float(v)))
+        )
+        s.set(self.var_bpm.get())
+        s.grid(row=0, column=4, sticky="ew", padx=(6,12))
+
+        self.btn_tap = ttk.Button(fx, text="Tap", command=self._tap_tempo)
+        self.btn_tap.grid(row=0, column=5, padx=(0,12))
+
+        ttk.Label(fx, text="Style").grid(row=0, column=6, sticky="e")
         self.var_style = tk.StringVar(value="psy")
-        ttk.Radiobutton(fx, text="Psy", value="psy", variable=self.var_style, command=self._on_style_change).grid(row=0, column=6, sticky="w")
-        ttk.Radiobutton(fx, text="Goa", value="goa", variable=self.var_style, command=self._on_style_change).grid(row=0, column=7, sticky="w")
+        ttk.Radiobutton(fx, text="Psy", value="psy", variable=self.var_style,
+                        command=self._on_style_change).grid(row=0, column=7, sticky="w")
+        ttk.Radiobutton(fx, text="Goa", value="goa", variable=self.var_style,
+                        command=self._on_style_change).grid(row=0, column=8, sticky="w")
 
-        ttk.Label(fx, text="Key").grid(row=0, column=8, sticky="e")
+        ttk.Label(fx, text="Key").grid(row=0, column=9, sticky="e")
         self.var_key = tk.StringVar(value="F#")
-        cmb = ttk.Combobox(fx, textvariable=self.var_key, values=list(NOTE_FREQS.keys()), width=4, state="readonly")
-        cmb.grid(row=0, column=9, sticky="w"); cmb.bind("<<ComboboxSelected>>", lambda e: self._on_key_change())
+        cmb = ttk.Combobox(fx, textvariable=self.var_key, values=list(NOTE_FREQS.keys()),
+                        width=4, state="readonly")
+        cmb.grid(row=0, column=10, sticky="w")
+        cmb.bind("<<ComboboxSelected>>", lambda e: self._on_key_change())
 
         # Scenes A..D
         for j, name in enumerate(["A", "B", "C", "D"]):
-            ttk.Button(fx, text=f"Queue {name}", command=lambda n=name: self._queue_scene(n)).grid(row=0, column=10+j, padx=(6,2))
+            ttk.Button(fx, text=f"Queue {name}", command=lambda n=name: self._queue_scene(n))\
+                .grid(row=0, column=11+j, padx=(6,2))
+
 
     def _tap_tempo(self):
         now = time.time()
         if not hasattr(self, "_tap_times"): self._tap_times = []
+        # שמור רק טפים מ-3 השניות האחרונות
         self._tap_times = [t for t in self._tap_times if now - t < 3.0]
         self._tap_times.append(now)
         if len(self._tap_times) >= 2:
-            intervals = [self._tap_times[i+1]-self._tap_times[i] for i in range(len(self._tap_times)-1)]
-            avg = sum(intervals) / len(intervals)
-            bpm = max(80, min(200, int(round(60.0 / max(0.05, avg)))))
+            intervals = [self._tap_times[i+1] - self._tap_times[i] for i in range(len(self._tap_times)-1)]
+            avg = max(0.05, sum(intervals) / len(intervals))
+            bpm = int(round(60.0 / avg))
+            bpm = max(30, min(230, bpm))  # clamp ל-30..230
             self._on_bpm_change(bpm)
+
 
     def _toggle_record(self):
         if self.graph.recording:
@@ -758,7 +779,9 @@ class LiveUI(ttk.Frame):
             self.btn_play.configure(text="Stop"); self.var_status.set("Playing…")
 
     def _on_bpm_change(self, bpm: int):
-        self.var_bpm.set(bpm); self.seq.set_bpm(bpm); self.var_status.set(f"BPM: {bpm}")
+        self.var_bpm.set(int(bpm))
+        self.seq.set_bpm(int(bpm))
+        self.var_status.set(f"BPM: {int(bpm)}")
 
     def _on_style_change(self): self.graph.set_style(self.var_style.get())
     def _on_key_change(self): self.graph.set_key(self.var_key.get()); self.var_status.set(f"Key: {self.var_key.get()}")
