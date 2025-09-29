@@ -472,6 +472,10 @@ class LiveSynthGraph:
 class LiveUI(ttk.Frame):
     def __init__(self, master: tk.Tk):
         super().__init__(master, padding=12)
+        # create early so handlers can safely use them
+        self.var_status = tk.StringVar(value="Ready.")
+        self.var_meters = tk.StringVar(value="")
+
         master.title("PsyForge Live – Kick/Bass/Acid + Delay + RGB + Painter")
         master.minsize(1240, 860)
 
@@ -808,33 +812,42 @@ class LiveUI(ttk.Frame):
     # ---------------- Sound Painter Panel ----------------
     def _build_painter_panel(self):
         box = ttk.LabelFrame(self, text="Sound Painter – draw to synthesize (X=Amplitude, Y=Frequency)")
+        # סיידבר ימין
         box.grid(row=1, column=1, rowspan=5, sticky="n", padx=(12,0), pady=(0,0))
 
         # Canvas
-        self.p_width, self.p_height = 480, 220
-        self.cnv = tk.Canvas(box, width=self.p_width, height=self.p_height, bg="#111111",
-                             highlightthickness=1, highlightbackground="#444")
+        self.p_width, self.p_height = 520, 260
+        self.cnv = tk.Canvas(
+            box, width=self.p_width, height=self.p_height,
+            bg="#0B0B0B", highlightthickness=1, highlightbackground="#666",
+            cursor="crosshair"
+        )
         self.cnv.grid(row=0, column=0, columnspan=6, sticky="w", padx=(10,10), pady=(8,8))
 
+        # ציור
         self._p_pts: list[tuple[int,int]] = []
         self._p_lines: list[int] = []
-
         self.cnv.bind("<Button-1>", self._p_on_down)
         self.cnv.bind("<B1-Motion>", self._p_on_drag)
         self.cnv.bind("<ButtonRelease-1>", self._p_on_up)
 
         # Controls
+        # Min / Max Freq + Loop (beats) — with live grid refresh
         ttk.Label(box, text="Min Freq (Hz)").grid(row=1, column=0, sticky="e", padx=(10,6))
         self.var_fmin = tk.IntVar(value=80)
-        ttk.Spinbox(box, from_=20, to=2000, textvariable=self.var_fmin, width=6).grid(row=1, column=1, sticky="w")
+        self.sb_min = ttk.Spinbox(box, from_=20, to=2000, textvariable=self.var_fmin, width=6, command=self._p_draw_grid)
+        self.sb_min.grid(row=1, column=1, sticky="w")
 
         ttk.Label(box, text="Max Freq (Hz)").grid(row=1, column=2, sticky="e", padx=(10,6))
         self.var_fmax = tk.IntVar(value=2400)
-        ttk.Spinbox(box, from_=200, to=12000, textvariable=self.var_fmax, width=6).grid(row=1, column=3, sticky="w")
+        self.sb_max = ttk.Spinbox(box, from_=200, to=12000, textvariable=self.var_fmax, width=6, command=self._p_draw_grid)
+        self.sb_max.grid(row=1, column=3, sticky="w")
 
         ttk.Label(box, text="Loop (beats)").grid(row=1, column=4, sticky="e", padx=(10,6))
         self.var_beats = tk.IntVar(value=4)
-        ttk.Spinbox(box, from_=1, to=16, textvariable=self.var_beats, width=4).grid(row=1, column=5, sticky="w")
+        self.sb_beats = ttk.Spinbox(box, from_=1, to=16, textvariable=self.var_beats, width=4, command=self._p_draw_grid)
+        self.sb_beats.grid(row=1, column=5, sticky="w")
+
 
         ttk.Label(box, text="Mode").grid(row=2, column=0, sticky="e", padx=(10,6))
         self.var_mode = tk.StringVar(value="sine")
@@ -843,7 +856,7 @@ class LiveUI(ttk.Frame):
         ttk.Label(box, text="Gain").grid(row=2, column=2, sticky="e", padx=(10,6))
         self.var_pgain = tk.DoubleVar(value=0.9)
         ttk.Scale(box, from_=0.0, to=1.5, orient="horizontal",
-                  command=lambda v: self.graph.set_painter_gain(float(v)))\
+                command=lambda v: self.graph.set_painter_gain(float(v)))\
             .grid(row=2, column=3, sticky="ew", padx=(4,10))
 
         self.var_quant = tk.BooleanVar(value=False)
@@ -851,21 +864,67 @@ class LiveUI(ttk.Frame):
 
         self.var_enable = tk.BooleanVar(value=False)
         ttk.Checkbutton(box, text="Enable Painter", variable=self.var_enable,
-                        command=lambda: self.graph.set_painter_enabled(self.var_enable.get())).grid(row=2, column=5, sticky="w")
+                        command=lambda: self.graph.set_painter_enabled(self.var_enable.get()))\
+            .grid(row=2, column=5, sticky="w")
 
-        ttk.Button(box, text="Apply Drawing", command=self._p_apply).grid(row=3, column=4, sticky="e", padx=(4,10))
-        ttk.Button(box, text="Clear", command=self._p_clear).grid(row=3, column=5, sticky="w", padx=(0,10))
+        ttk.Button(box, text="Apply Drawing", command=self._p_apply)\
+            .grid(row=3, column=4, sticky="e", padx=(4,10))
+        ttk.Button(box, text="Clear", command=self._p_clear)\
+            .grid(row=3, column=5, sticky="w", padx=(0,10))
+
+        # מידע על השרטוט
+        self.var_pinfo = tk.StringVar(value="Draw a path, set ranges, Apply, then Enable.")
+        ttk.Label(box, textvariable=self.var_pinfo).grid(row=4, column=0, columnspan=6, sticky="w", padx=(10,10), pady=(6,0))
 
         for c in range(0, 6): box.columnconfigure(c, weight=1)
 
+        # גריד/צירים
+        self._p_draw_grid()
+
+    def _p_draw_grid(self):
+        """Draw background grid, axes and labels on the painter canvas."""
+        c = self.cnv
+        c.delete("grid")
+        w, h = self.p_width, self.p_height
+
+        # מסגרת
+        c.create_rectangle(1, 1, w-2, h-2, outline="#888", width=1, tags="grid")
+
+        # קווי גריד כל 10%
+        for i in range(1, 10):
+            x = int(w * i/10); y = int(h * i/10)
+            c.create_line(x, 2, x, h-2, fill="#222", width=1, tags="grid")
+            c.create_line(2, y, w-2, y, fill="#222", width=1, tags="grid")
+
+        # ציר X (אמפליטודה 0..1) — טיקים וטקסט
+        for i, lbl in zip([0, 5, 10], ["0", "0.5", "1.0"]):
+            x = int(w * i/10)
+            c.create_line(x, h-2, x, h-8, fill="#AAA", width=2, tags="grid")
+            c.create_text(x+12, h-12, text=lbl, fill="#AAA", font=("Segoe UI", 8), tags="grid")
+
+        # ציר Y (תדר) — תחתית=Min, למעלה=Max
+        fmin, fmax = self.var_fmin.get(), self.var_fmax.get()
+        c.create_text(8, h-12, text=f"{fmin} Hz", anchor="w", fill="#AAA", font=("Segoe UI", 8), tags="grid")
+        c.create_text(8, 12,     text=f"{fmax} Hz", anchor="w", fill="#AAA", font=("Segoe UI", 8), tags="grid")
+
+        # סקאלת זמן (0..beats)
+        beats = self.var_beats.get()
+        c.create_text(w-10, h-12, text=f"{beats} beats", anchor="e", fill="#AAA", font=("Segoe UI", 8), tags="grid")
+
+
     def _p_on_down(self, e):
         self._p_pts = [(e.x, e.y)]
+        # מחיקת קווים קודמים של השרטוט (לא את הגריד)
+        for lid in self._p_lines: self.cnv.delete(lid)
         self._p_lines = []
         self._p_last = (e.x, e.y)
 
     def _p_on_drag(self, e):
         x0,y0 = self._p_last
-        line = self.cnv.create_line(x0,y0, e.x,e.y, fill="#33CCFF", width=2, capstyle=tk.ROUND, smooth=True)
+        line = self.cnv.create_line(
+            x0,y0, e.x,e.y,
+            fill="#39C2FF", width=3, capstyle=tk.ROUND, smooth=True, tags=("stroke",)
+        )
         self._p_lines.append(line)
         self._p_pts.append((e.x, e.y))
         self._p_last = (e.x, e.y)
@@ -873,41 +932,49 @@ class LiveUI(ttk.Frame):
     def _p_on_up(self, e):
         pass
 
+
     def _p_clear(self):
-        for lid in self._p_lines:
-            self.cnv.delete(lid)
-        self._p_lines.clear()
-        self._p_pts.clear()
+        # מחיקת השרטוט מהקנבס
+        for lid in self._p_lines: self.cnv.delete(lid)
+        self._p_lines.clear(); self._p_pts.clear()
+        # ציור מחדש של הגריד
+        self._p_draw_grid()
+        # ניתוק הסאונד הקודם כדי "לשמוע רק את מה שמצויר"
+        self.graph.set_painter_curve(np.array([], dtype=np.float32), np.array([], dtype=np.float32), 0)
+        # כיבוי Enable
+        if hasattr(self, "var_enable"):
+            self.var_enable.set(False)
+            self.graph.set_painter_enabled(False)
+        # מידע
+        self.var_pinfo.set("Cleared. Draw a new path and Apply.")
+        self.var_status.set("Painter cleared.")
+
 
     def _p_apply(self):
         if not self._p_pts:
             self.var_status.set("Painter: draw a path first."); return
         pts = np.array(self._p_pts, dtype=np.float32)
 
-        # arc-length as time
+        # arc-length->time
         diffs = np.diff(pts, axis=0)
         seglen = np.sqrt((diffs**2).sum(axis=1))
         arc = np.concatenate([[0.0], np.cumsum(seglen)])
         total = float(arc[-1]) if arc[-1] > 0 else 1.0
         arc /= total
 
-        # loop length from beats & BPM
         beats = int(self.var_beats.get())
         bpm = int(self.var_bpm.get())
         loop_samples = max(1, int((60.0 / bpm) * beats * SR))
 
-        # resample
         t = np.linspace(0.0, 1.0, loop_samples, dtype=np.float32)
         x = np.interp(t, arc, pts[:,0])
         y = np.interp(t, arc, pts[:,1])
 
-        # map X->amp, Y->freq (log-ish), Y up = high
         amp = np.clip(x / float(self.p_width), 0.0, 1.0).astype(np.float32)
         fmin = float(self.var_fmin.get()); fmax = float(self.var_fmax.get())
         y_norm = 1.0 - np.clip(y / float(self.p_height), 0.0, 1.0)
         freq = (fmin * (fmax / fmin) ** y_norm).astype(np.float32)
 
-        # quantize (chromatic around Key) – MVP
         if bool(self.var_quant.get()):
             root = NOTE_FREQS.get(self.var_key.get().upper(), 46.25)
             notes = []
@@ -919,13 +986,22 @@ class LiveUI(ttk.Frame):
                 idx = np.abs(notes.reshape(1,-1) - freq.reshape(-1,1)).argmin(axis=1)
                 freq = notes[idx]
 
-        # install
+        # התקנה למנוע – זה מחליף כל עקומה קודמת
         self.graph.set_painter_mode(self.var_mode.get())
         self.graph.set_painter_gain(float(self.var_pgain.get()))
-        self.graph.set_painter_enabled(bool(self.var_enable.get()))
         self.graph.set_painter_curve(freq, amp, loop_samples)
 
-        self.var_status.set(f"Painter applied: {beats} beats, {bpm} BPM, {loop_samples} samples.")
+        # הפעלה אוטומטית אם מסומן Enable
+        if self.var_enable.get():
+            self.graph.set_painter_enabled(True)
+
+        dur_sec = (60.0 / bpm) * beats
+        self.var_pinfo.set(
+            f"Applied: {beats} beats (~{dur_sec:.2f}s) | {loop_samples} samples | "
+            f"Freq {int(fmin)}–{int(fmax)} Hz | Amp 0–1"
+        )
+        self.var_status.set("Painter applied.")
+
 
     # ---------------- Status + meters ----------------
     def _build_status(self):
@@ -965,7 +1041,10 @@ class LiveUI(ttk.Frame):
     def _on_bpm_change(self, bpm: int):
         self.var_bpm.set(int(bpm))
         self.seq.set_bpm(int(bpm))
-        self.var_status.set(f"BPM: {int(bpm)}")
+        # guard: might be called before status widgets are built
+        if hasattr(self, "var_status"):
+            self.var_status.set(f"BPM: {int(bpm)}")
+
 
     def _on_style_change(self): self.graph.set_style(self.var_style.get())
     def _on_key_change(self): self.graph.set_key(self.var_key.get()); self.var_status.set(f"Key: {self.var_key.get()}")
