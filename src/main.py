@@ -1,11 +1,11 @@
 """
-PsyForge Live – Kick/Bass/Acid + Drums + Delay + RGB + Scenes + Recording
+PsyForge Live – Kick/Bass/Acid + Drums + Delay + RGB + Scenes + Recording + Sound Painter
 Run:
     python src/ui_live.py
 """
 
 from __future__ import annotations
-import os, time
+import time
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
@@ -17,7 +17,7 @@ try:
 except Exception:
     sf = None
 
-# ---- Engine + instruments you already have ----
+# ---- Engine + instruments (from your project) ----
 from psyforge.constants import SR
 from psyforge.rt_audio import RtAudioEngine
 from psyforge.rt_sequencer import StepSequencer
@@ -88,7 +88,6 @@ class ClapSynth:
         self.decay_s = float(decay_s)
         self.level = float(level)
 
-    # ----- simple one-pole filters (fast & stable) -----
     def _onepole_lp(self, x: np.ndarray, fc: float) -> np.ndarray:
         alpha = float(np.exp(-2.0 * np.pi * fc / SR))
         y = np.empty_like(x)
@@ -101,45 +100,38 @@ class ClapSynth:
         return y
 
     def _onepole_hp(self, x: np.ndarray, fc: float) -> np.ndarray:
-        # HP = x - LP(x)
         return (x - self._onepole_lp(x, fc)).astype(np.float32)
 
-    # ----- synthesis -----
     def trigger(self) -> np.ndarray:
         n = max(1, int(SR * self.length_ms / 1000.0))
-        # base noise
         noise = np.random.randn(n).astype(np.float32)
 
-        # band-pass (HP then LP)
+        # band-pass
         x = self._onepole_hp(noise, self.hp_cut)
         x = self._onepole_lp(x, self.lp_cut)
 
-        # multi-burst envelope cluster
+        # burst envelopes
         env = np.zeros(n, dtype=np.float32)
-        weights = [1.0, 0.82, 0.66, 0.55]  # relative loudness of bursts
+        weights = [1.0, 0.82, 0.66, 0.55]
         for j, ms in enumerate(self.bursts_ms):
             off = int(SR * ms / 1000.0)
-            if off >= n:
-                continue
+            if off >= n: continue
             m = n - off
             t = np.arange(m, dtype=np.float32) / SR
             e = np.exp(-t / self.decay_s, dtype=np.float32) * (weights[j] if j < len(weights) else 0.5)
             env[off:off+m] += e
 
-        # apply envelope
         x *= env
 
-        # short fade in/out to avoid hard edges
+        # fades
         fade = min(64, n // 20)
         if fade > 0:
             w = np.linspace(0.0, 1.0, fade, dtype=np.float32)
-            x[:fade] *= w
-            x[-fade:] *= w[::-1]
+            x[:fade] *= w; x[-fade:] *= w[::-1]
 
-        # tiny dither kills denormals on some CPUs
+        # dither tiny
         x += (1e-8 * np.random.randn(n)).astype(np.float32)
 
-        # level & return
         return (x * self.level).astype(np.float32)
 
 # =============================================================================
@@ -185,7 +177,7 @@ class StereoDelay:
 
 class LiveSynthGraph:
     """
-    Manages instruments, patterns, FX, ducking, scenes, meters & recording.
+    Manages instruments, patterns, FX, ducking, scenes, meters, recording & Sound Painter.
     """
     def __init__(self, seq: StepSequencer, style: str = "psy", key: str = "F#"):
         self.seq = seq
@@ -203,7 +195,7 @@ class LiveSynthGraph:
         self.hat  = HatSynth()
         self.clap = ClapSynth()
 
-        # Mixer gains (kick loud by default)
+        # Mixer gains
         self.g_kick = 1.60
         self.g_bass = 0.85
         self.g_acid = 0.95
@@ -229,6 +221,10 @@ class LiveSynthGraph:
         self.meter_peak = 0.0
         self.meter_rms = 0.0
 
+        # Bar/Beat UI
+        self.bar_count = 1
+        self.current_step = 0
+
         # Active voices
         self.active: list[dict] = []
 
@@ -236,6 +232,16 @@ class LiveSynthGraph:
         self._rng = np.random.default_rng(42)
         self.acid_octave = 0
         self.acid_pattern = "Root"
+
+        # --- Sound Painter state ---
+        self.painter_enabled = False
+        self.painter_gain = 0.9
+        self.painter_mode = "sine"  # 'sine' or 'saw'
+        self.painter_freq = None    # np.ndarray
+        self.painter_amp = None     # np.ndarray
+        self.painter_loop_len = 0
+        self._painter_pos = 0
+        self._painter_phase = 0.0
 
     # --- setters / glue ---
     def set_style(self, s: str): self.style = s
@@ -304,6 +310,25 @@ class LiveSynthGraph:
             if k in self.seq.patterns and len(self.seq.patterns[k]) == len(v):
                 self.seq.patterns[k] = v.copy()
 
+    # --- Sound Painter API ---
+    def set_painter_enabled(self, flag: bool): self.painter_enabled = bool(flag)
+    def set_painter_gain(self, v: float): self.painter_gain = float(max(0.0, v))
+    def set_painter_mode(self, name: str): self.painter_mode = name
+
+    def set_painter_curve(self, freq_curve_hz: np.ndarray, amp_curve: np.ndarray, loop_samples: int):
+        if loop_samples <= 0:
+            self.painter_freq = None; self.painter_amp = None; self.painter_loop_len = 0
+            return
+        self.painter_loop_len = int(loop_samples)
+        self.painter_freq = np.asarray(freq_curve_hz, dtype=np.float32).reshape(-1)
+        self.painter_amp  = np.asarray(amp_curve, dtype=np.float32).reshape(-1)
+        n = min(len(self.painter_freq), len(self.painter_amp), self.painter_loop_len)
+        self.painter_freq = self.painter_freq[:n]
+        self.painter_amp  = self.painter_amp[:n]
+        self.painter_loop_len = n
+        self._painter_pos = 0
+        self._painter_phase = 0.0
+
     # --- helpers ---
     def _acid_semitone_for_step(self, s: int) -> int:
         if self.acid_pattern == "Root": return 0
@@ -322,6 +347,7 @@ class LiveSynthGraph:
         step0_in_block = False
 
         for track, step in triggers:
+            self.current_step = int(step)
             if step == 0:
                 step0_in_block = True
             if track == "kick":
@@ -344,9 +370,11 @@ class LiveSynthGraph:
                 self.active.append({"buf": self.clap.trigger(), "pos": 0, "trk": "clap"})
 
         # scene switch at bar boundary
-        if step0_in_block and self.queued_scene and self.queued_scene in self.scenes:
-            self._apply_scene_now(self.scenes[self.queued_scene])
-            self.queued_scene = None
+        if step0_in_block:
+            self.bar_count += 1
+            if self.queued_scene and self.queued_scene in self.scenes:
+                self._apply_scene_now(self.scenes[self.queued_scene])
+                self.queued_scene = None
 
         # sidechain envelope for this block (exp decay)
         duck = np.empty(frames, dtype=np.float32)
@@ -395,6 +423,32 @@ class LiveSynthGraph:
         if self.acid_send > 1e-4:
             out += self.delay.process_send(acid_dry, self.acid_send)
 
+        # --- Sound Painter mixing ---
+        if self.painter_enabled and self.painter_loop_len > 0 and self.painter_freq is not None:
+            n = frames
+            loop_len = self.painter_loop_len
+            freq = self.painter_freq
+            amp = self.painter_amp
+            pos = self._painter_pos
+            phase = self._painter_phase
+            g = float(self.painter_gain)
+            for i in range(n):
+                idx = pos % loop_len
+                f = float(freq[idx])
+                a = float(amp[idx]) * g
+                phase += (2.0 * np.pi) * (f / SR)
+                if phase >= 2.0 * np.pi:
+                    phase -= 2.0 * np.pi
+                if self.painter_mode == "saw":
+                    sample = (phase / np.pi) - 1.0
+                else:
+                    sample = np.sin(phase, dtype=np.float32)
+                s = sample * a
+                out[0, i] += s; out[1, i] += s
+                pos += 1
+            self._painter_pos = pos % loop_len
+            self._painter_phase = phase
+
         # meters
         peak = float(np.max(np.abs(out))) + 1e-9
         self.meter_peak = 0.9 * self.meter_peak + 0.1 * peak
@@ -418,12 +472,11 @@ class LiveSynthGraph:
 class LiveUI(ttk.Frame):
     def __init__(self, master: tk.Tk):
         super().__init__(master, padding=12)
-        master.title("PsyForge Live – Kick/Bass/Acid + Delay + RGB")
-        master.minsize(1240, 820)
+        master.title("PsyForge Live – Kick/Bass/Acid + Delay + RGB + Painter")
+        master.minsize(1240, 860)
 
         # Sequencer + default patterns
         self.seq = StepSequencer(bpm=145, steps=16)
-        # ensure patterns exist
         for k in ["kick", "bass", "acid", "acid_acc", "acid_sld", "hat", "clap"]:
             if k not in self.seq.patterns:
                 self.seq.patterns[k] = np.zeros(16, dtype=np.int8)
@@ -444,15 +497,20 @@ class LiveUI(ttk.Frame):
         self._build_acid_controls()
         self._build_delay_controls()
         self._build_rgb_designer()
+        self._build_painter_panel()
         self._build_status()
 
         # layout
         self.grid(sticky="nsew")
+        # 2-column layout: main (col 0) + right sidebar (col 1)
+        self.columnconfigure(0, weight=3)
+        self.columnconfigure(1, weight=2)
+
         master.columnconfigure(0, weight=1); master.rowconfigure(0, weight=1)
 
-    # ---------------- Transport (Play, REC, Tap, Style, Key, Scenes) ----------------
+    # ---------------- Transport (Play, REC, Tap, Style, Key, Scenes, BPM readout) ----------------
     def _build_transport(self):
-        fx = ttk.Frame(self); fx.grid(row=0, column=0, sticky="ew", pady=(0,8))
+        fx = ttk.Frame(self); fx.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,8))
         for c in range(16): fx.columnconfigure(c, weight=1)
 
         self.btn_play = ttk.Button(fx, text="Play", command=self._toggle_play)
@@ -461,7 +519,6 @@ class LiveUI(ttk.Frame):
         self.btn_rec  = ttk.Button(fx, text="REC",  command=self._toggle_record)
         self.btn_rec.grid(row=0, column=1, padx=(0,12))
 
-        # BPM label + numeric display + slider (30..230)
         ttk.Label(fx, text="BPM").grid(row=0, column=2, sticky="e")
         self.var_bpm = tk.IntVar(value=145)
         self.lbl_bpm_val = ttk.Label(fx, textvariable=self.var_bpm, width=4, anchor="w")
@@ -479,37 +536,33 @@ class LiveUI(ttk.Frame):
 
         ttk.Label(fx, text="Style").grid(row=0, column=6, sticky="e")
         self.var_style = tk.StringVar(value="psy")
-        ttk.Radiobutton(fx, text="Psy", value="psy", variable=self.var_style,
-                        command=self._on_style_change).grid(row=0, column=7, sticky="w")
-        ttk.Radiobutton(fx, text="Goa", value="goa", variable=self.var_style,
-                        command=self._on_style_change).grid(row=0, column=8, sticky="w")
+        ttk.Radiobutton(fx, text="Psy", value="psy", variable=self.var_style, command=self._on_style_change).grid(row=0, column=7, sticky="w")
+        ttk.Radiobutton(fx, text="Goa", value="goa", variable=self.var_style, command=self._on_style_change).grid(row=0, column=8, sticky="w")
 
         ttk.Label(fx, text="Key").grid(row=0, column=9, sticky="e")
         self.var_key = tk.StringVar(value="F#")
-        cmb = ttk.Combobox(fx, textvariable=self.var_key, values=list(NOTE_FREQS.keys()),
-                        width=4, state="readonly")
-        cmb.grid(row=0, column=10, sticky="w")
-        cmb.bind("<<ComboboxSelected>>", lambda e: self._on_key_change())
+        cmb = ttk.Combobox(fx, textvariable=self.var_key, values=list(NOTE_FREQS.keys()), width=4, state="readonly")
+        cmb.grid(row=0, column=10, sticky="w"); cmb.bind("<<ComboboxSelected>>", lambda e: self._on_key_change())
 
         # Scenes A..D
         for j, name in enumerate(["A", "B", "C", "D"]):
-            ttk.Button(fx, text=f"Queue {name}", command=lambda n=name: self._queue_scene(n))\
-                .grid(row=0, column=11+j, padx=(6,2))
+            ttk.Button(fx, text=f"Queue {name}", command=lambda n=name: self._queue_scene(n)).grid(row=0, column=11+j, padx=(6,2))
 
+        # Bar/Beat display (right side)
+        self.var_pos = tk.StringVar(value="Bar 1 • Beat 1.1")
+        ttk.Label(fx, textvariable=self.var_pos).grid(row=0, column=15, sticky="e", padx=(6,0))
 
     def _tap_tempo(self):
         now = time.time()
         if not hasattr(self, "_tap_times"): self._tap_times = []
-        # שמור רק טפים מ-3 השניות האחרונות
         self._tap_times = [t for t in self._tap_times if now - t < 3.0]
         self._tap_times.append(now)
         if len(self._tap_times) >= 2:
-            intervals = [self._tap_times[i+1] - self._tap_times[i] for i in range(len(self._tap_times)-1)]
+            intervals = [self._tap_times[i+1]-self._tap_times[i] for i in range(len(self._tap_times)-1)]
             avg = max(0.05, sum(intervals) / len(intervals))
             bpm = int(round(60.0 / avg))
-            bpm = max(30, min(230, bpm))  # clamp ל-30..230
+            bpm = max(30, min(230, bpm))
             self._on_bpm_change(bpm)
-
 
     def _toggle_record(self):
         if self.graph.recording:
@@ -752,9 +805,131 @@ class LiveUI(ttk.Frame):
 
         ttk.Button(parent, text="Apply", command=on_apply).grid(row=row, column=7, sticky="e")
 
+    # ---------------- Sound Painter Panel ----------------
+    def _build_painter_panel(self):
+        box = ttk.LabelFrame(self, text="Sound Painter – draw to synthesize (X=Amplitude, Y=Frequency)")
+        box.grid(row=1, column=1, rowspan=5, sticky="n", padx=(12,0), pady=(0,0))
+
+        # Canvas
+        self.p_width, self.p_height = 480, 220
+        self.cnv = tk.Canvas(box, width=self.p_width, height=self.p_height, bg="#111111",
+                             highlightthickness=1, highlightbackground="#444")
+        self.cnv.grid(row=0, column=0, columnspan=6, sticky="w", padx=(10,10), pady=(8,8))
+
+        self._p_pts: list[tuple[int,int]] = []
+        self._p_lines: list[int] = []
+
+        self.cnv.bind("<Button-1>", self._p_on_down)
+        self.cnv.bind("<B1-Motion>", self._p_on_drag)
+        self.cnv.bind("<ButtonRelease-1>", self._p_on_up)
+
+        # Controls
+        ttk.Label(box, text="Min Freq (Hz)").grid(row=1, column=0, sticky="e", padx=(10,6))
+        self.var_fmin = tk.IntVar(value=80)
+        ttk.Spinbox(box, from_=20, to=2000, textvariable=self.var_fmin, width=6).grid(row=1, column=1, sticky="w")
+
+        ttk.Label(box, text="Max Freq (Hz)").grid(row=1, column=2, sticky="e", padx=(10,6))
+        self.var_fmax = tk.IntVar(value=2400)
+        ttk.Spinbox(box, from_=200, to=12000, textvariable=self.var_fmax, width=6).grid(row=1, column=3, sticky="w")
+
+        ttk.Label(box, text="Loop (beats)").grid(row=1, column=4, sticky="e", padx=(10,6))
+        self.var_beats = tk.IntVar(value=4)
+        ttk.Spinbox(box, from_=1, to=16, textvariable=self.var_beats, width=4).grid(row=1, column=5, sticky="w")
+
+        ttk.Label(box, text="Mode").grid(row=2, column=0, sticky="e", padx=(10,6))
+        self.var_mode = tk.StringVar(value="sine")
+        ttk.Combobox(box, textvariable=self.var_mode, state="readonly", width=6, values=["sine","saw"]).grid(row=2, column=1, sticky="w")
+
+        ttk.Label(box, text="Gain").grid(row=2, column=2, sticky="e", padx=(10,6))
+        self.var_pgain = tk.DoubleVar(value=0.9)
+        ttk.Scale(box, from_=0.0, to=1.5, orient="horizontal",
+                  command=lambda v: self.graph.set_painter_gain(float(v)))\
+            .grid(row=2, column=3, sticky="ew", padx=(4,10))
+
+        self.var_quant = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="Quantize to scale (Key)", variable=self.var_quant).grid(row=2, column=4, sticky="w")
+
+        self.var_enable = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="Enable Painter", variable=self.var_enable,
+                        command=lambda: self.graph.set_painter_enabled(self.var_enable.get())).grid(row=2, column=5, sticky="w")
+
+        ttk.Button(box, text="Apply Drawing", command=self._p_apply).grid(row=3, column=4, sticky="e", padx=(4,10))
+        ttk.Button(box, text="Clear", command=self._p_clear).grid(row=3, column=5, sticky="w", padx=(0,10))
+
+        for c in range(0, 6): box.columnconfigure(c, weight=1)
+
+    def _p_on_down(self, e):
+        self._p_pts = [(e.x, e.y)]
+        self._p_lines = []
+        self._p_last = (e.x, e.y)
+
+    def _p_on_drag(self, e):
+        x0,y0 = self._p_last
+        line = self.cnv.create_line(x0,y0, e.x,e.y, fill="#33CCFF", width=2, capstyle=tk.ROUND, smooth=True)
+        self._p_lines.append(line)
+        self._p_pts.append((e.x, e.y))
+        self._p_last = (e.x, e.y)
+
+    def _p_on_up(self, e):
+        pass
+
+    def _p_clear(self):
+        for lid in self._p_lines:
+            self.cnv.delete(lid)
+        self._p_lines.clear()
+        self._p_pts.clear()
+
+    def _p_apply(self):
+        if not self._p_pts:
+            self.var_status.set("Painter: draw a path first."); return
+        pts = np.array(self._p_pts, dtype=np.float32)
+
+        # arc-length as time
+        diffs = np.diff(pts, axis=0)
+        seglen = np.sqrt((diffs**2).sum(axis=1))
+        arc = np.concatenate([[0.0], np.cumsum(seglen)])
+        total = float(arc[-1]) if arc[-1] > 0 else 1.0
+        arc /= total
+
+        # loop length from beats & BPM
+        beats = int(self.var_beats.get())
+        bpm = int(self.var_bpm.get())
+        loop_samples = max(1, int((60.0 / bpm) * beats * SR))
+
+        # resample
+        t = np.linspace(0.0, 1.0, loop_samples, dtype=np.float32)
+        x = np.interp(t, arc, pts[:,0])
+        y = np.interp(t, arc, pts[:,1])
+
+        # map X->amp, Y->freq (log-ish), Y up = high
+        amp = np.clip(x / float(self.p_width), 0.0, 1.0).astype(np.float32)
+        fmin = float(self.var_fmin.get()); fmax = float(self.var_fmax.get())
+        y_norm = 1.0 - np.clip(y / float(self.p_height), 0.0, 1.0)
+        freq = (fmin * (fmax / fmin) ** y_norm).astype(np.float32)
+
+        # quantize (chromatic around Key) – MVP
+        if bool(self.var_quant.get()):
+            root = NOTE_FREQS.get(self.var_key.get().upper(), 46.25)
+            notes = []
+            for midi in range(-48, 72):
+                hz = root * (2.0 ** (midi / 12.0))
+                if fmin <= hz <= fmax: notes.append(hz)
+            notes = np.array(notes, dtype=np.float32)
+            if len(notes):
+                idx = np.abs(notes.reshape(1,-1) - freq.reshape(-1,1)).argmin(axis=1)
+                freq = notes[idx]
+
+        # install
+        self.graph.set_painter_mode(self.var_mode.get())
+        self.graph.set_painter_gain(float(self.var_pgain.get()))
+        self.graph.set_painter_enabled(bool(self.var_enable.get()))
+        self.graph.set_painter_curve(freq, amp, loop_samples)
+
+        self.var_status.set(f"Painter applied: {beats} beats, {bpm} BPM, {loop_samples} samples.")
+
     # ---------------- Status + meters ----------------
     def _build_status(self):
-        st = ttk.Frame(self); st.grid(row=6, column=0, sticky="ew", pady=(8,0))
+        st = ttk.Frame(self); st.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8,0))
         self.var_status = tk.StringVar(value="Stopped.")
         self.var_meters = tk.StringVar(value="")
         ttk.Label(st, textvariable=self.var_status).grid(row=0, column=0, sticky="w")
@@ -767,6 +942,15 @@ class LiveUI(ttk.Frame):
             return max(-80.0, 20.0 * math.log10(max(1e-9, float(x))))
         pk = db(self.graph.meter_peak); rms = db(self.graph.meter_rms)
         self.var_meters.set(f"Peak {pk:.1f} dBFS | RMS {rms:.1f} dBFS")
+
+        # position: 16 steps per bar, 4/4 → Beat = step//4 + 1, Sixteenth = step%4 + 1
+        step = int(getattr(self.graph, "current_step", 0))
+        beat = (step // 4) + 1
+        sixteenth = (step % 4) + 1
+        bar = int(getattr(self.graph, "bar_count", 1))
+        if hasattr(self, "var_pos"):
+            self.var_pos.set(f"Bar {bar} • Beat {beat}.{sixteenth}")
+
         self.after(200, self._poll_meters)
 
     # ---------------- Simple handlers ----------------
