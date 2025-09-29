@@ -171,6 +171,30 @@ class StereoDelay:
         self.idx = idx
         return out
 
+
+class PainterLayer:
+    """One freehand-drawn oscillator layer."""
+    def __init__(self, name="Layer 1", color="#39C2FF"):
+        # user params
+        self.name = name
+        self.color = color
+        self.enabled = False
+        self.mode = "sine"   # "sine" or "saw"
+        self.quantize = False
+        self.gain = 0.9
+        self.fmin = 80.0
+        self.fmax = 2400.0
+        self.beats = 4
+
+        # curves (per-sample)
+        self.freq = None     # np.float32
+        self.amp  = None     # np.float32
+        self.loop_len = 0
+
+        # runtime
+        self._pos = 0
+        self._phase = 0.0
+
 # =============================================================================
 # Synth graph & audio callback
 # =============================================================================
@@ -234,14 +258,18 @@ class LiveSynthGraph:
         self.acid_pattern = "Root"
 
         # --- Sound Painter state ---
-        self.painter_enabled = False
-        self.painter_gain = 0.9
-        self.painter_mode = "sine"  # 'sine' or 'saw'
-        self.painter_freq = None    # np.ndarray
-        self.painter_amp = None     # np.ndarray
-        self.painter_loop_len = 0
-        self._painter_pos = 0
-        self._painter_phase = 0.0
+        # self.painter_enabled = False
+        # self.painter_gain = 0.9
+        # self.painter_mode = "sine"  # 'sine' or 'saw'
+        # self.painter_freq = None    # np.ndarray
+        # self.painter_amp = None     # np.ndarray
+        # self.painter_loop_len = 0
+        # self._painter_pos = 0
+        # self._painter_phase = 0.0
+
+        # --- Sound Painter Layers ---
+        self.layers: list[PainterLayer] = [PainterLayer("Layer 1", "#39C2FF")]
+
 
     # --- setters / glue ---
     def set_style(self, s: str): self.style = s
@@ -336,6 +364,38 @@ class LiveSynthGraph:
             seq = [0,3,5,7,10,7,5,3,0,-2,-5,-7,-5,-2,0,3]
             return seq[s % 16]
         return int(self._rng.choice([0,2,3,5,7,9,10,12,-2,-5]))
+    
+    def painter_add_layer(self, name: str, color: str) -> int:
+        self.layers.append(PainterLayer(name, color))
+        return len(self.layers) - 1
+
+    def painter_remove_layer(self, idx: int):
+        if 0 <= idx < len(self.layers) and len(self.layers) > 1:
+            self.layers.pop(idx)
+
+    def painter_set_curve(self, idx: int, freq: np.ndarray, amp: np.ndarray, loop_len: int):
+        if not (0 <= idx < len(self.layers)): return
+        L = self.layers[idx]
+        if loop_len <= 0:
+            L.freq = None; L.amp = None; L.loop_len = 0; L._pos = 0; L._phase = 0.0
+            return
+        L.freq = np.asarray(freq, dtype=np.float32).reshape(-1)
+        L.amp  = np.asarray(amp, dtype=np.float32).reshape(-1)
+        n = min(len(L.freq), len(L.amp), int(loop_len))
+        L.freq = L.freq[:n]; L.amp = L.amp[:n]; L.loop_len = n; L._pos = 0; L._phase = 0.0
+
+    def painter_set_enabled(self, idx: int, flag: bool):
+        if 0 <= idx < len(self.layers): self.layers[idx].enabled = bool(flag)
+
+    def painter_update_params(self, idx: int, *, mode=None, gain=None, fmin=None, fmax=None, beats=None, quantize=None):
+        if not (0 <= idx < len(self.layers)): return
+        L = self.layers[idx]
+        if mode is not None: L.mode = mode
+        if gain is not None: L.gain = float(gain)
+        if fmin is not None: L.fmin = float(fmin)
+        if fmax is not None: L.fmax = float(fmax)
+        if beats is not None: L.beats = int(beats)
+        if quantize is not None: L.quantize = bool(quantize)
 
     # --- audio callback ---
     def render(self, frames: int) -> np.ndarray:
@@ -424,30 +484,52 @@ class LiveSynthGraph:
             out += self.delay.process_send(acid_dry, self.acid_send)
 
         # --- Sound Painter mixing ---
-        if self.painter_enabled and self.painter_loop_len > 0 and self.painter_freq is not None:
-            n = frames
-            loop_len = self.painter_loop_len
-            freq = self.painter_freq
-            amp = self.painter_amp
-            pos = self._painter_pos
-            phase = self._painter_phase
-            g = float(self.painter_gain)
+        # if self.painter_enabled and self.painter_loop_len > 0 and self.painter_freq is not None:
+        #     n = frames
+        #     loop_len = self.painter_loop_len
+        #     freq = self.painter_freq
+        #     amp = self.painter_amp
+        #     pos = self._painter_pos
+        #     phase = self._painter_phase
+        #     g = float(self.painter_gain)
+        #     for i in range(n):
+        #         idx = pos % loop_len
+        #         f = float(freq[idx])
+        #         a = float(amp[idx]) * g
+        #         phase += (2.0 * np.pi) * (f / SR)
+        #         if phase >= 2.0 * np.pi:
+        #             phase -= 2.0 * np.pi
+        #         if self.painter_mode == "saw":
+        #             sample = (phase / np.pi) - 1.0
+        #         else:
+        #             sample = np.sin(phase, dtype=np.float32)
+        #         s = sample * a
+        #         out[0, i] += s; out[1, i] += s
+        #         pos += 1
+        #     self._painter_pos = pos % loop_len
+        #     self._painter_phase = phase
+
+        # --- Sound Painter: mix all enabled layers ---
+        for L in self.layers:
+            if not (L.enabled and L.loop_len > 0 and L.freq is not None): 
+                continue
+            n = frames; loop_len = L.loop_len
+            freq = L.freq; amp = L.amp
+            pos = L._pos; phase = L._phase; g = float(L.gain)
             for i in range(n):
                 idx = pos % loop_len
-                f = float(freq[idx])
-                a = float(amp[idx]) * g
+                f = float(freq[idx]); a = float(amp[idx]) * g
                 phase += (2.0 * np.pi) * (f / SR)
-                if phase >= 2.0 * np.pi:
-                    phase -= 2.0 * np.pi
-                if self.painter_mode == "saw":
+                if phase >= 2.0 * np.pi: phase -= 2.0 * np.pi
+                if L.mode == "saw":
                     sample = (phase / np.pi) - 1.0
                 else:
                     sample = np.sin(phase, dtype=np.float32)
                 s = sample * a
                 out[0, i] += s; out[1, i] += s
                 pos += 1
-            self._painter_pos = pos % loop_len
-            self._painter_phase = phase
+            L._pos = pos % loop_len; L._phase = phase
+
 
         # meters
         peak = float(np.max(np.abs(out))) + 1e-9
@@ -470,6 +552,14 @@ class LiveSynthGraph:
 # =============================================================================
 
 class LiveUI(ttk.Frame):
+
+    # Colors
+    STEP_ON_BG  = "#2D7DFF"
+    STEP_OFF_BG = "#F4F4F6"
+    STEP_ON_FG  = "#FFFFFF"
+    STEP_OFF_FG = "#A0A4AB"
+    STEP_BORDER = "#C9CDD3"
+
     def __init__(self, master: tk.Tk):
         super().__init__(master, padding=12)
         # create early so handlers can safely use them
@@ -595,12 +685,41 @@ class LiveUI(ttk.Frame):
         self.var_status.set(f"Scene {name} stored.")
 
     # ---------------- Sequencer Grid (steps + tools) ----------------
+    # --- Step cell visuals (pretty grid boxes) ---
+    def _step_update(self, lbl: tk.Label, val: int):
+        """Paint a step cell as ON/OFF."""
+        if val:
+            lbl.configure(bg=self.STEP_ON_BG, fg=self.STEP_ON_FG, text="✓")
+        else:
+            lbl.configure(bg=self.STEP_OFF_BG, fg=self.STEP_OFF_FG, text="")
+        lbl.configure(highlightthickness=0, bd=1, relief="solid")
+
+    def _make_step_cell(self, parent, track: str, step_idx: int, init_val: int):
+        """Create a clickable square step cell bound to sequencer pattern."""
+        var = tk.IntVar(value=int(init_val))
+        lbl = tk.Label(
+            parent, width=2, height=1,
+            bg=self.STEP_OFF_BG, fg=self.STEP_OFF_FG,
+            bd=1, relief="solid", cursor="hand2"
+        )
+        self._step_update(lbl, var.get())
+
+        def toggle(_evt=None):
+            var.set(0 if var.get() else 1)
+            self.seq.patterns[track][step_idx] = var.get()
+            self._step_update(lbl, var.get())
+
+        lbl.bind("<Button-1>", toggle)
+        return var, lbl
+
     def _build_grid(self):
         g = ttk.LabelFrame(self, text="Sequencer (click to toggle steps)")
         g.grid(row=1, column=0, sticky="nsew")
         self.rowconfigure(1, weight=1)
 
-        for c in range(1, 17): g.columnconfigure(c, weight=1)
+        for c in range(1, 17):
+            g.columnconfigure(c, weight=1, uniform="steps")
+
         for c in (0, 17, 18, 19, 20, 21, 22): g.columnconfigure(c, weight=0)
 
         labels = [("Kick", "kick"), ("Bass", "bass"), ("Acid", "acid"),
@@ -613,11 +732,11 @@ class LiveUI(ttk.Frame):
             ttk.Label(g, text=title).grid(row=r, column=0, sticky="w", padx=10)
             pattern = self.seq.patterns[track]
             for c in range(16):
-                var = tk.IntVar(value=int(pattern[c]))
-                btn = ttk.Checkbutton(g, variable=var, onvalue=1, offvalue=0,
-                                      command=lambda t=track, s=c: self._toggle_step(t, s))
-                btn.grid(row=r, column=c+1, padx=3, pady=6)
-                self.step_vars[track].append(var); self.step_btns[track].append(btn)
+                var, cell = self._make_step_cell(g, track, c, int(pattern[c]))
+                cell.grid(row=r, column=c+1, padx=3, pady=6, sticky="nsew")
+                self.step_vars[track].append(var)
+                self.step_btns[track].append(cell)
+
             ttk.Button(g, text="Fill All",  command=lambda t=track: self._fill_row(t)).grid(row=r, column=17, padx=(8,4), pady=6, sticky="e")
             ttk.Button(g, text="Clear All", command=lambda t=track: self._clear_row(t)).grid(row=r, column=18, padx=(4,4), pady=6, sticky="w")
             ttk.Button(g, text="Invert",    command=lambda t=track: self._invert_row(t)).grid(row=r, column=19, padx=(4,4), pady=6, sticky="w")
@@ -632,26 +751,31 @@ class LiveUI(ttk.Frame):
         pat[step] = 1 if int(var_list[step].get()) else 0
 
     def _fill_row(self, track: str):
-        pat = self.seq.patterns.get(track); vars_list = self.step_vars.get(track)
+        pat = self.seq.patterns.get(track); vars_list = self.step_vars.get(track); cells = self.step_btns.get(track)
         if pat is None or vars_list is None: return
-        for i in range(len(pat)): pat[i] = 1; vars_list[i].set(1)
+        for i in range(len(pat)):
+            pat[i] = 1; vars_list[i].set(1); self._step_update(cells[i], 1)
 
     def _clear_row(self, track: str):
-        pat = self.seq.patterns.get(track); vars_list = self.step_vars.get(track)
+        pat = self.seq.patterns.get(track); vars_list = self.step_vars.get(track); cells = self.step_btns.get(track)
         if pat is None or vars_list is None: return
-        for i in range(len(pat)): pat[i] = 0; vars_list[i].set(0)
+        for i in range(len(pat)):
+            pat[i] = 0; vars_list[i].set(0); self._step_update(cells[i], 0)
 
     def _invert_row(self, track: str):
-        pat = self.seq.patterns.get(track); vars_list = self.step_vars.get(track)
+        pat = self.seq.patterns.get(track); vars_list = self.step_vars.get(track); cells = self.step_btns.get(track)
         if pat is None or vars_list is None: return
-        for i in range(len(pat)): pat[i] = 0 if pat[i] else 1; vars_list[i].set(int(pat[i]))
+        for i in range(len(pat)):
+            v = 0 if pat[i] else 1
+            pat[i] = v; vars_list[i].set(v); self._step_update(cells[i], v)
 
     def _pattern_every_n(self, track: str, n: int, start: int = 0):
-        pat = self.seq.patterns.get(track); vars_list = self.step_vars.get(track)
+        pat = self.seq.patterns.get(track); vars_list = self.step_vars.get(track); cells = self.step_btns.get(track)
         if pat is None or vars_list is None: return
         for i in range(len(pat)):
             val = 1 if ((i - start) % n == 0) else 0
-            pat[i] = val; vars_list[i].set(val)
+            pat[i] = val; vars_list[i].set(val); self._step_update(cells[i], val)
+
 
     # ---------------- Mixer & Bass tone ----------------
     def _build_mixer(self):
@@ -811,75 +935,85 @@ class LiveUI(ttk.Frame):
 
     # ---------------- Sound Painter Panel ----------------
     def _build_painter_panel(self):
-        box = ttk.LabelFrame(self, text="Sound Painter – draw to synthesize (X=Amplitude, Y=Frequency)")
-        # סיידבר ימין
-        box.grid(row=1, column=1, rowspan=5, sticky="n", padx=(12,0), pady=(0,0))
+        box = ttk.LabelFrame(self, text="Sound Painter – multilayer (X=Amplitude, Y=Frequency)")
+        box.grid(row=1, column=1, rowspan=6, sticky="n", padx=(12,0), pady=(0,0))
 
-        # Canvas
+        # ---------- Left: layers list + buttons ----------
+        left = ttk.Frame(box); left.grid(row=0, column=0, sticky="ns", padx=(10,6), pady=8)
+        ttk.Label(left, text="Layers").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.lst_layers = tk.Listbox(left, height=6, exportselection=False)
+        self.lst_layers.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        left.rowconfigure(1, weight=1)
+        for i, L in enumerate(self.graph.layers):
+            self.lst_layers.insert(tk.END, f"{L.name}")
+        self.lst_layers.selection_set(0)
+        self.current_layer = 0
+        self.lst_layers.bind("<<ListboxSelect>>", lambda e: self._layer_select())
+
+        ttk.Button(left, text="+ Add", command=self._layer_add).grid(row=2, column=0, sticky="ew", pady=(6,2))
+        ttk.Button(left, text="Duplicate", command=self._layer_dup).grid(row=2, column=1, sticky="ew", pady=(6,2))
+        ttk.Button(left, text="Delete", command=self._layer_del).grid(row=3, column=0, sticky="ew")
+        ttk.Button(left, text="Clear draw", command=self._layer_clear).grid(row=3, column=1, sticky="ew")
+
+        # ---------- Right: canvas + params ----------
+        right = ttk.Frame(box); right.grid(row=0, column=1, sticky="n", padx=(6,10), pady=8)
+
+        # canvas
         self.p_width, self.p_height = 520, 260
-        self.cnv = tk.Canvas(
-            box, width=self.p_width, height=self.p_height,
-            bg="#0B0B0B", highlightthickness=1, highlightbackground="#666",
-            cursor="crosshair"
-        )
-        self.cnv.grid(row=0, column=0, columnspan=6, sticky="w", padx=(10,10), pady=(8,8))
-
-        # ציור
-        self._p_pts: list[tuple[int,int]] = []
-        self._p_lines: list[int] = []
+        self.cnv = tk.Canvas(right, width=self.p_width, height=self.p_height,
+                            bg="#0B0B0B", highlightthickness=1, highlightbackground="#666", cursor="crosshair")
+        self.cnv.grid(row=0, column=0, columnspan=6, sticky="w")
+        self._p_pts = []; self._p_lines = []
         self.cnv.bind("<Button-1>", self._p_on_down)
         self.cnv.bind("<B1-Motion>", self._p_on_drag)
         self.cnv.bind("<ButtonRelease-1>", self._p_on_up)
 
-        # Controls
-        # Min / Max Freq + Loop (beats) — with live grid refresh
-        ttk.Label(box, text="Min Freq (Hz)").grid(row=1, column=0, sticky="e", padx=(10,6))
-        self.var_fmin = tk.IntVar(value=80)
-        self.sb_min = ttk.Spinbox(box, from_=20, to=2000, textvariable=self.var_fmin, width=6, command=self._p_draw_grid)
+        # params (per layer)
+        ttk.Label(right, text="Min Freq (Hz)").grid(row=1, column=0, sticky="e", padx=(8,6))
+        self.var_fmin = tk.IntVar(value=int(self.graph.layers[0].fmin))
+        self.sb_min = ttk.Spinbox(right, from_=20, to=2000, textvariable=self.var_fmin, width=6, command=self._layer_params_changed)
         self.sb_min.grid(row=1, column=1, sticky="w")
 
-        ttk.Label(box, text="Max Freq (Hz)").grid(row=1, column=2, sticky="e", padx=(10,6))
-        self.var_fmax = tk.IntVar(value=2400)
-        self.sb_max = ttk.Spinbox(box, from_=200, to=12000, textvariable=self.var_fmax, width=6, command=self._p_draw_grid)
+        ttk.Label(right, text="Max Freq (Hz)").grid(row=1, column=2, sticky="e", padx=(8,6))
+        self.var_fmax = tk.IntVar(value=int(self.graph.layers[0].fmax))
+        self.sb_max = ttk.Spinbox(right, from_=200, to=12000, textvariable=self.var_fmax, width=6, command=self._layer_params_changed)
         self.sb_max.grid(row=1, column=3, sticky="w")
 
-        ttk.Label(box, text="Loop (beats)").grid(row=1, column=4, sticky="e", padx=(10,6))
-        self.var_beats = tk.IntVar(value=4)
-        self.sb_beats = ttk.Spinbox(box, from_=1, to=16, textvariable=self.var_beats, width=4, command=self._p_draw_grid)
+        ttk.Label(right, text="Loop (beats)").grid(row=1, column=4, sticky="e", padx=(8,6))
+        self.var_beats = tk.IntVar(value=int(self.graph.layers[0].beats))
+        self.sb_beats = ttk.Spinbox(right, from_=1, to=16, textvariable=self.var_beats, width=4, command=self._layer_params_changed)
         self.sb_beats.grid(row=1, column=5, sticky="w")
 
+        ttk.Label(right, text="Mode").grid(row=2, column=0, sticky="e", padx=(8,6))
+        self.var_mode = tk.StringVar(value=self.graph.layers[0].mode)
+        ttk.Combobox(right, textvariable=self.var_mode, state="readonly", width=6, values=["sine","saw"])\
+            .grid(row=2, column=1, sticky="w")
 
-        ttk.Label(box, text="Mode").grid(row=2, column=0, sticky="e", padx=(10,6))
-        self.var_mode = tk.StringVar(value="sine")
-        ttk.Combobox(box, textvariable=self.var_mode, state="readonly", width=6, values=["sine","saw"]).grid(row=2, column=1, sticky="w")
-
-        ttk.Label(box, text="Gain").grid(row=2, column=2, sticky="e", padx=(10,6))
-        self.var_pgain = tk.DoubleVar(value=0.9)
-        ttk.Scale(box, from_=0.0, to=1.5, orient="horizontal",
-                command=lambda v: self.graph.set_painter_gain(float(v)))\
+        ttk.Label(right, text="Gain").grid(row=2, column=2, sticky="e", padx=(8,6))
+        self.var_pgain = tk.DoubleVar(value=self.graph.layers[0].gain)
+        ttk.Scale(right, from_=0.0, to=1.6, orient="horizontal",
+                command=lambda v: self._layer_gain_changed(float(v)))\
             .grid(row=2, column=3, sticky="ew", padx=(4,10))
 
-        self.var_quant = tk.BooleanVar(value=False)
-        ttk.Checkbutton(box, text="Quantize to scale (Key)", variable=self.var_quant).grid(row=2, column=4, sticky="w")
+        self.var_quant = tk.BooleanVar(value=self.graph.layers[0].quantize)
+        ttk.Checkbutton(right, text="Quantize to scale (Key)", variable=self.var_quant).grid(row=2, column=4, sticky="w")
 
-        self.var_enable = tk.BooleanVar(value=False)
-        ttk.Checkbutton(box, text="Enable Painter", variable=self.var_enable,
-                        command=lambda: self.graph.set_painter_enabled(self.var_enable.get()))\
+        self.var_enable = tk.BooleanVar(value=self.graph.layers[0].enabled)
+        ttk.Checkbutton(right, text="Enable Layer", variable=self.var_enable,
+                        command=lambda: self._layer_enable_toggle())\
             .grid(row=2, column=5, sticky="w")
 
-        ttk.Button(box, text="Apply Drawing", command=self._p_apply)\
-            .grid(row=3, column=4, sticky="e", padx=(4,10))
-        ttk.Button(box, text="Clear", command=self._p_clear)\
-            .grid(row=3, column=5, sticky="w", padx=(0,10))
+        ttk.Button(right, text="Apply Drawing → Layer", command=self._layer_apply).grid(row=3, column=4, sticky="e", padx=(4,10))
+        ttk.Button(right, text="Clear (Layer audio)", command=self._layer_clear_audio).grid(row=3, column=5, sticky="w", padx=(0,10))
 
-        # מידע על השרטוט
-        self.var_pinfo = tk.StringVar(value="Draw a path, set ranges, Apply, then Enable.")
-        ttk.Label(box, textvariable=self.var_pinfo).grid(row=4, column=0, columnspan=6, sticky="w", padx=(10,10), pady=(6,0))
+        # info line
+        self.var_pinfo = tk.StringVar(value="Draw, set params, Apply → Enable.")
+        ttk.Label(right, textvariable=self.var_pinfo).grid(row=4, column=0, columnspan=6, sticky="w", pady=(6,0))
 
-        for c in range(0, 6): box.columnconfigure(c, weight=1)
-
-        # גריד/צירים
+        for c in range(0,6): right.columnconfigure(c, weight=1)
+        box.columnconfigure(1, weight=1)
         self._p_draw_grid()
+
 
     def _p_draw_grid(self):
         """Draw background grid, axes and labels on the painter canvas."""
@@ -914,24 +1048,20 @@ class LiveUI(ttk.Frame):
 
     def _p_on_down(self, e):
         self._p_pts = [(e.x, e.y)]
-        # מחיקת קווים קודמים של השרטוט (לא את הגריד)
         for lid in self._p_lines: self.cnv.delete(lid)
         self._p_lines = []
         self._p_last = (e.x, e.y)
 
     def _p_on_drag(self, e):
         x0,y0 = self._p_last
-        line = self.cnv.create_line(
-            x0,y0, e.x,e.y,
-            fill="#39C2FF", width=3, capstyle=tk.ROUND, smooth=True, tags=("stroke",)
-        )
+        color = self.graph.layers[self.current_layer].color
+        line = self.cnv.create_line(x0,y0, e.x,e.y, fill=color, width=3, capstyle=tk.ROUND, smooth=True, tags=("stroke",))
         self._p_lines.append(line)
         self._p_pts.append((e.x, e.y))
         self._p_last = (e.x, e.y)
 
     def _p_on_up(self, e):
         pass
-
 
     def _p_clear(self):
         # מחיקת השרטוט מהקנבס
@@ -1001,6 +1131,119 @@ class LiveUI(ttk.Frame):
             f"Freq {int(fmin)}–{int(fmax)} Hz | Amp 0–1"
         )
         self.var_status.set("Painter applied.")
+    # ---------------- Add layers ---------------------
+
+    def _layer_select(self):
+        sel = self.lst_layers.curselection()
+        if not sel: return
+        idx = int(sel[0])
+        self.current_layer = idx
+        L = self.graph.layers[idx]
+        self.var_fmin.set(int(L.fmin)); self.var_fmax.set(int(L.fmax)); self.var_beats.set(int(L.beats))
+        self.var_mode.set(L.mode); self.var_pgain.set(L.gain); self.var_quant.set(L.quantize); self.var_enable.set(L.enabled)
+        self._p_draw_grid()
+        self.var_pinfo.set(f"Selected: {L.name} ({L.color})")
+
+    def _layer_add(self):
+        if len(self.graph.layers) >= 8:
+            self.var_status.set("Max 8 layers."); return
+        colors = ["#39C2FF","#FF8C39","#A1E751","#FF4D88","#FFD166","#06D6A0","#9B5DE5","#4EA8DE"]
+        col = colors[len(self.graph.layers) % len(colors)]
+        idx = self.graph.painter_add_layer(f"Layer {len(self.graph.layers)+1}", col)
+        self.lst_layers.insert(tk.END, self.graph.layers[idx].name)
+        self.lst_layers.selection_clear(0, tk.END); self.lst_layers.selection_set(idx)
+        self._layer_select()
+
+    def _layer_dup(self):
+        L = self.graph.layers[self.current_layer]
+        idx = self.graph.painter_add_layer(f"{L.name} copy", L.color)
+        C = self.graph.layers[idx]
+        C.mode=L.mode; C.quantize=L.quantize; C.gain=L.gain; C.fmin=L.fmin; C.fmax=L.fmax; C.beats=L.beats
+        C.freq = (None if L.freq is None else L.freq.copy()); C.amp = (None if L.amp is None else L.amp.copy()); C.loop_len = L.loop_len
+        self.lst_layers.insert(tk.END, C.name)
+        self.lst_layers.selection_clear(0, tk.END); self.lst_layers.selection_set(idx)
+        self._layer_select()
+
+    def _layer_del(self):
+        if len(self.graph.layers) <= 1: 
+            self.var_status.set("Keep at least one layer."); return
+        idx = self.current_layer
+        self.graph.painter_remove_layer(idx)
+        self.lst_layers.delete(idx)
+        new_idx = max(0, idx-1)
+        self.lst_layers.selection_clear(0, tk.END); self.lst_layers.selection_set(new_idx)
+        self.current_layer = new_idx
+        self._layer_select()
+
+    def _layer_clear(self):
+        # clear drawing (canvas only)
+        for lid in self._p_lines: self.cnv.delete(lid)
+        self._p_lines.clear(); self._p_pts.clear()
+        self._p_draw_grid()
+
+    def _layer_clear_audio(self):
+        # clear layer audio curve → won’t play
+        self.graph.painter_set_curve(self.current_layer, np.array([],dtype=np.float32), np.array([],dtype=np.float32), 0)
+        self.var_pinfo.set("Layer audio cleared. Draw+Apply to replace.")
+
+    def _layer_gain_changed(self, v: float):
+        self.graph.painter_update_params(self.current_layer, gain=v)
+
+    def _layer_enable_toggle(self):
+        self.graph.painter_set_enabled(self.current_layer, self.var_enable.get())
+
+    def _layer_params_changed(self):
+        self.graph.painter_update_params(
+            self.current_layer,
+            fmin=self.var_fmin.get(), fmax=self.var_fmax.get(),
+            beats=self.var_beats.get(), mode=self.var_mode.get(), quantize=self.var_quant.get()
+        )
+        if hasattr(self, "_p_draw_grid"): self._p_draw_grid()
+
+    def _layer_apply(self):
+        if not self._p_pts:
+            self.var_status.set("Painter: draw first."); return
+        pts = np.array(self._p_pts, dtype=np.float32)
+        diffs = np.diff(pts, axis=0)
+        seglen = np.sqrt((diffs**2).sum(axis=1))
+        arc = np.concatenate([[0.0], np.cumsum(seglen)])
+        total = float(arc[-1]) if arc[-1] > 0 else 1.0
+        arc /= total
+
+        L = self.graph.layers[self.current_layer]
+        beats = int(self.var_beats.get()); bpm = int(self.var_bpm.get())
+        loop_samples = max(1, int((60.0 / bpm) * beats * SR))
+
+        t = np.linspace(0.0, 1.0, loop_samples, dtype=np.float32)
+        x = np.interp(t, arc, pts[:,0]); y = np.interp(t, arc, pts[:,1])
+
+        amp = np.clip(x / float(self.p_width), 0.0, 1.0).astype(np.float32)
+        fmin = float(self.var_fmin.get()); fmax = float(self.var_fmax.get())
+        y_norm = 1.0 - np.clip(y / float(self.p_height), 0.0, 1.0)
+        freq = (fmin * (fmax / fmin) ** y_norm).astype(np.float32)
+
+        if bool(self.var_quant.get()):
+            root = NOTE_FREQS.get(self.var_key.get().upper(), 46.25)
+            notes=[]
+            for midi in range(-48,72):
+                hz = root * (2.0 ** (midi/12.0))
+                if fmin <= hz <= fmax: notes.append(hz)
+            if notes:
+                notes = np.array(notes, dtype=np.float32)
+                idx = np.abs(notes.reshape(1,-1) - freq.reshape(-1,1)).argmin(axis=1)
+                freq = notes[idx]
+
+        self.graph.painter_update_params(self.current_layer,
+                                        mode=self.var_mode.get(), gain=float(self.var_pgain.get()),
+                                        fmin=fmin, fmax=fmax, beats=beats, quantize=bool(self.var_quant.get()))
+        self.graph.painter_set_curve(self.current_layer, freq, amp, loop_samples)
+
+        # enable if checked
+        if self.var_enable.get(): self.graph.painter_set_enabled(self.current_layer, True)
+
+        dur = (60.0/bpm)*beats
+        self.var_pinfo.set(f"{L.name}: {beats} beats (~{dur:.2f}s) | {loop_samples} samples | {int(fmin)}–{int(fmax)} Hz")
+        self.var_status.set("Layer applied.")
 
 
     # ---------------- Status + meters ----------------
